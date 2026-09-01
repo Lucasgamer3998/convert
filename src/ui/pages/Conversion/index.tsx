@@ -5,7 +5,8 @@ import mime from "mime";
 import { ConversionOptions, SelectedFiles, type ConversionOption, type ConversionOptionsMap } from 'src/main';
 import { Mode, ModeEnum } from "src/ui/ModeStore";
 import normalizeMimeType from "src/normalizeMimeType";
-import type { FileFormat } from "src/FormatHandler";
+import type { ConvertPathNode, FileData, FileFormat } from "src/FormatHandler";
+import { downloadFile, downloadFilesAsZip } from "src/ui/downloadFiles";
 
 import ConversionHeader from "src/ui/components/Conversion/ConversionHeader";
 import FormatExplorer from "src/ui/components/Conversion/FormatExplorer";
@@ -108,14 +109,6 @@ function getMatchingFromFormats(options: ConversionOptionsMap, files: File[]): C
 	return matched.size > 0 ? matched : options;
 }
 
-function downloadFile(bytes: Uint8Array, name: string, mime: string) {
-	const blob = new Blob([bytes as BlobPart], { type: mime });
-	const link = document.createElement("a");
-	link.href = URL.createObjectURL(blob);
-	link.download = name;
-	link.click();
-}
-
 export default function Conversion() {
 	const allOptions = getConversionOptions();
 	const files = Object.values(SelectedFiles.value);
@@ -153,6 +146,11 @@ export default function Conversion() {
 
 	const [toOption, setToOption] = useState<ConversionOption | null>(null);
 	const [isConverting, setIsConverting] = useState(false);
+	// When several files are selected, they're converted independently by
+	// default. Handlers that join their inputs (FFmpeg's concat, ImageMagick's
+	// image collections) are still reachable by opting into "combine".
+	const [combineFiles, setCombineFiles] = useState(false);
+	const [activeFile, setActiveFile] = useState<File | null>(null);
 
 	useEffect(() => {
 		if (!firstFile || isConverting) return;
@@ -167,6 +165,7 @@ export default function Conversion() {
 		}
 
 		setToOption(null);
+		setCombineFiles(false);
 	}, [firstFile]);
 
 	const handleFromSelect = useCallback((option: ConversionOption | null) => {
@@ -219,30 +218,62 @@ export default function Conversion() {
 		const abortController = ProgressStore.controller;
 
 		try {
-			const inputFileData = [];
+			const outputs: FileData[] = [];
+			const pending: { file: File; data: FileData }[] = [];
+			const isSameFormat = fromOption[0].mime === toOption[0].mime
+				&& fromOption[0].format === toOption[0].format;
+
 			for (const f of files) {
-				const buf = await f.arrayBuffer();
-				const bytes = new Uint8Array(buf);
-
-				if (fromOption[0].mime === toOption[0].mime && fromOption[0].format === toOption[0].format) {
-					downloadFile(bytes, f.name, toOption[0].mime);
-					continue;
-				}
-				inputFileData.push({ name: f.name, bytes });
-			}
-
-			if (inputFileData.length === 0) {
-				setIsConverting(false);
-				setStep("select-to");
-				return;
+				const bytes = new Uint8Array(await f.arrayBuffer());
+				// Files already in the target format pass straight through.
+				if (isSameFormat) outputs.push({ name: f.name, bytes });
+				else pending.push({ file: f, data: { name: f.name, bytes } });
 			}
 
 			const fromNode = { handler: fromOption[1], format: fromOption[0] };
 			const toNode = { handler: toOption[1], format: toOption[0] };
 
-			const output = await window.tryConvertByTraversing(inputFileData, fromNode, toNode, abortController.signal);
+			// A single batch holding every file lets the handler join them into
+			// one output; one batch per file converts them independently.
+			const batches = combineFiles ? [pending] : pending.map(entry => [entry]);
+			const failed: string[] = [];
+			let usedPath: ConvertPathNode[] | null = null;
 
-			if (!output) {
+			for (let i = 0; i < batches.length; i ++) {
+				const batch = batches[i];
+				if (!batch.length) continue;
+				// Cancelling has to stop the whole batch, not just one file.
+				if (abortController.signal.aborted) {
+					throw new DOMException("Conversion cancelled", "AbortError");
+				}
+
+				setActiveFile(batch[0].file);
+				if (batches.length > 1) {
+					ProgressStore.progress(`Converting file ${i + 1} of ${batches.length}...`, 0);
+				}
+
+				const output = await window.tryConvertByTraversing(
+					batch.map(entry => entry.data),
+					fromNode,
+					toNode,
+					abortController.signal
+				);
+
+				if (abortController.signal.aborted) {
+					throw new DOMException("Conversion cancelled", "AbortError");
+				}
+
+				// A file with no valid route shouldn't sink the whole batch.
+				if (!output) {
+					failed.push(...batch.map(entry => entry.data.name));
+					continue;
+				}
+
+				usedPath = output.path;
+				outputs.push(...output.files);
+			}
+
+			if (outputs.length === 0) {
 				setIsConverting(false);
 				setStep("select-to");
 				PopupData.value = {
@@ -255,13 +286,28 @@ export default function Conversion() {
 				return;
 			}
 
-			for (const file of output.files) {
-				downloadFile(file.bytes, file.name, toOption[0].mime);
+			// Browsers block bursts of automatic downloads, so anything past a
+			// single output has to leave the page as one archive.
+			if (outputs.length === 1) {
+				downloadFile(outputs[0].bytes, outputs[0].name, toOption[0].mime);
+			} else {
+				ProgressStore.progress(`Packaging ${outputs.length} files...`, 1);
+				await downloadFilesAsZip(outputs, `converted-${toOption[0].extension}.zip`);
 			}
+
+			const route = usedPath
+				? ` via ${usedPath.map(c => c.format.format).join(" → ")}`
+				: "";
+			const skipped = failed.length
+				? ` Skipped ${failed.length} file${failed.length === 1 ? "" : "s"} with no valid route: ${failed.join(", ")}.`
+				: "";
+			const summary = outputs.length === 1
+				? `Converted ${fromOption[0].format.toUpperCase()} → ${toOption[0].format.toUpperCase()}${route}`
+				: `Converted ${outputs.length} files to ${toOption[0].format.toUpperCase()}${route}, downloaded as a ZIP archive.`;
 
 			PopupData.value = {
 				title: "Conversion complete!",
-				text: `Converted ${fromOption[0].format.toUpperCase()} → ${toOption[0].format.toUpperCase()} via ${output.path.map(c => c.format.format).join(" → ")}`,
+				text: `${summary}${skipped}`,
 				dismissible: true,
 				buttonText: "OK",
 			};
@@ -281,6 +327,7 @@ export default function Conversion() {
 			}
 		} finally {
 			setIsConverting(false);
+			setActiveFile(null);
 			ConversionInProgress.value = false;
 			setStep("select-to");
 		}
@@ -295,8 +342,8 @@ export default function Conversion() {
 			<main className="conversion-main">
 				{step === "converting" ? (
 					<LoadingScreen
-						fileName={firstFile?.name || "file"}
-						fileSize={firstFile?.size}
+						fileName={(activeFile ?? firstFile)?.name || "file"}
+						fileSize={(activeFile ?? firstFile)?.size}
 						from={fromOption?.[0]}
 						to={toOption?.[0]}
 					/>
@@ -329,6 +376,16 @@ export default function Conversion() {
 							/>
 						))}
 					</div>
+					{step === "select-to" && files.length > 1 && (
+						<label className="conversion-combine-toggle">
+							<input
+								type="checkbox"
+								checked={combineFiles}
+								onChange={e => setCombineFiles((e.target as HTMLInputElement).checked)}
+							/>
+							Combine into one file
+						</label>
+					)}
 					{step === "select-to" && (
 						<StyledButton onClick={handleBack}>
 							<ArrowLeft size={16} />
