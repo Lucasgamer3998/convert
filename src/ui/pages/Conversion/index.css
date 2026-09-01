@@ -38,3 +38,19 @@
 	flex-shrink: 1;
 	min-width: 0;
 }
+
+.conversion-combine-toggle {
+	display: flex;
+	align-items: center;
+	gap: 0.4rem;
+	flex-shrink: 0;
+	color: var(--text-secondary);
+	font-size: 0.875rem;
+	user-select: none;
+	cursor: pointer;
+}
+
+.conversion-combine-toggle input {
+	cursor: pointer;
+	margin: 0;
+}
